@@ -1,0 +1,203 @@
+name: 👥 Request Reviewers
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - labeled
+      - ready_for_review
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: request-reviewers-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request-reviewers:
+    runs-on: ubuntu-latest
+
+    if: |
+      !github.event.pull_request.draft &&
+      contains(github.event.pull_request.labels.*.name, 'stage-1-approved')
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Request reviewers
+        uses: actions/github-script@v8
+
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          script: |
+            const fs = require('fs');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+
+            // ─────────────────────────────────────────────
+            // Labels
+            // ─────────────────────────────────────────────
+            const labels = (pr.labels || []).map(
+              l => l.name.toLowerCase()
+            );
+
+            const isGssoc =
+              labels.includes('gssoc26');
+
+            // ─────────────────────────────────────────────
+            // Prevent duplicate reviewer requests
+            // ─────────────────────────────────────────────
+            const requested =
+              await github.rest.pulls.listRequestedReviewers({
+                owner,
+                repo,
+                pull_number: prNumber
+              });
+
+            const alreadyRequested =
+              (requested.data.users || []).map(
+                u => u.login.toLowerCase()
+              );
+
+            // Already has 2 reviewers requested
+            if (alreadyRequested.length >= 2) {
+
+              core.info(
+                'Reviewers already requested. Skipping.'
+              );
+
+              return;
+            }
+
+            // ─────────────────────────────────────────────
+            // Load reviewer pool
+            // ─────────────────────────────────────────────
+            const reviewerFile = isGssoc
+              ? '.github/reviewers/gssoc-mentors.json'
+              : '.github/reviewers/nsoc-reviewers.json';
+
+            let reviewerPool = [];
+
+            try {
+
+              const raw = fs.readFileSync(
+                reviewerFile,
+                'utf8'
+              );
+
+              const parsed = JSON.parse(raw);
+
+              reviewerPool =
+                parsed.reviewers || [];
+
+            } catch (err) {
+
+              core.setFailed(
+                `Failed to load reviewer pool: ${reviewerFile}`
+              );
+
+              return;
+            }
+
+            // ─────────────────────────────────────────────
+            // Remove PR author
+            // ─────────────────────────────────────────────
+            reviewerPool =
+              reviewerPool.filter(
+                reviewer =>
+                  reviewer.toLowerCase() !==
+                  pr.user.login.toLowerCase()
+              );
+
+            // ─────────────────────────────────────────────
+            // Remove already requested reviewers
+            // ─────────────────────────────────────────────
+            reviewerPool =
+              reviewerPool.filter(
+                reviewer =>
+                  !alreadyRequested.includes(
+                    reviewer.toLowerCase()
+                  )
+              );
+
+            // ─────────────────────────────────────────────
+            // Ensure enough reviewers exist
+            // ─────────────────────────────────────────────
+            if (reviewerPool.length < 2) {
+
+              core.setFailed(
+                'Not enough eligible reviewers available.'
+              );
+
+              return;
+            }
+
+            // ─────────────────────────────────────────────
+            // Fisher-Yates shuffle
+            // ─────────────────────────────────────────────
+            for (
+              let i = reviewerPool.length - 1;
+              i > 0;
+              i--
+            ) {
+
+              const j = Math.floor(
+                Math.random() * (i + 1)
+              );
+
+              [reviewerPool[i], reviewerPool[j]] =
+                [reviewerPool[j], reviewerPool[i]];
+            }
+
+            // ─────────────────────────────────────────────
+            // Select exactly 2 reviewers
+            // ─────────────────────────────────────────────
+            const selected =
+              reviewerPool.slice(0, 2);
+
+            // ─────────────────────────────────────────────
+            // Request reviewers
+            // ─────────────────────────────────────────────
+            await github.rest.pulls.requestReviewers({
+              owner,
+              repo,
+              pull_number: prNumber,
+              reviewers: selected
+            });
+
+            core.info(
+              `Requested reviewers: ${selected.join(', ')}`
+            );
+
+            // ─────────────────────────────────────────────
+            // Add tracking label
+            // ─────────────────────────────────────────────
+            const reviewLabel = isGssoc
+              ? 'mentor-review-requested'
+              : 'nsoc-review-requested';
+
+            try {
+
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: prNumber,
+                labels: [reviewLabel]
+              });
+
+            } catch (err) {
+
+              core.warning(
+                `Failed to add label: ${err.message}`
+              );
+            }

@@ -1,0 +1,346 @@
+name: 🚦 PR Stage Manager
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: pr-stage-manager-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  stage-manager:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Evaluate PR Pipeline
+        uses: actions/github-script@v8
+
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+
+            // ─────────────────────────────────────────────
+            // Small delay for labels/checks to settle
+            // ─────────────────────────────────────────────
+            if (
+              context.payload.action === 'opened' ||
+              context.payload.action === 'synchronize'
+            ) {
+              await new Promise(r => setTimeout(r, 12000));
+            }
+
+            // ─────────────────────────────────────────────
+            // Fetch labels
+            // ─────────────────────────────────────────────
+            const { data: labelData } =
+              await github.rest.issues.listLabelsOnIssue({
+                owner,
+                repo,
+                issue_number: prNumber
+              });
+
+            const labels =
+              labelData.map(l => l.name);
+
+            // ─────────────────────────────────────────────
+            // Detect PR type
+            // ─────────────────────────────────────────────
+            const isGSSOC =
+              labels.includes('gssoc26');
+
+            const isNSOC =
+              labels.includes('nsoc26');
+
+            // ─────────────────────────────────────────────
+            // Stage 1 checks
+            // ─────────────────────────────────────────────
+            const dcoVerified =
+              labels.includes('dco-verified');
+
+            const dcoMissing =
+              labels.includes('dco-missing');
+
+            const aiSlop =
+              labels.includes('ai-slop');
+
+            const duplicatePR =
+              labels.includes('possible-duplicate-pr');
+
+            const stage1Passed =
+              dcoVerified &&
+              !dcoMissing &&
+              !aiSlop;
+
+            // ─────────────────────────────────────────────
+            // Labels helper
+            // ─────────────────────────────────────────────
+            async function addLabel(name) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  labels: [name]
+                });
+              } catch (err) {}
+            }
+
+            async function removeLabel(name) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  name
+                });
+              } catch (err) {}
+            }
+
+            // ─────────────────────────────────────────────
+            // Stage 1 label handling
+            // ─────────────────────────────────────────────
+            if (stage1Passed) {
+
+              await addLabel('stage-1-approved');
+
+              await removeLabel('needs-stage-1-fixes');
+
+            } else {
+
+              await removeLabel('stage-1-approved');
+
+              await addLabel('needs-stage-1-fixes');
+            }
+
+            // ─────────────────────────────────────────────
+            // Stage 2 labels
+            // ─────────────────────────────────────────────
+            const mentorApproved =
+              labels.includes('mentor-approved');
+
+            const reviewerApproved =
+              labels.includes('review-approved');
+
+            // ─────────────────────────────────────────────
+            // Stage 3 labels
+            // ─────────────────────────────────────────────
+            const paApproved =
+              labels.includes('pa-approved');
+
+            // ─────────────────────────────────────────────
+            // Build status rows
+            // ─────────────────────────────────────────────
+
+            // Stage 1
+            let s1Icon = '⏳';
+            let s1Text = 'Waiting for automated checks';
+
+            if (stage1Passed) {
+              s1Icon = '✅';
+              s1Text = 'All automated checks passed';
+            }
+
+            if (dcoMissing || aiSlop) {
+              s1Icon = '❌';
+              s1Text = 'Automated validation failed';
+            }
+
+            // Stage 2
+            let s2Icon = '🔒';
+            let s2Text = 'Blocked until Stage 1 passes';
+
+            if (stage1Passed) {
+
+              s2Icon = '⏳';
+
+              if (isGSSOC) {
+                s2Text =
+                  'Waiting for 2 approved GSSOC mentor reviews';
+              } else {
+                s2Text =
+                  'Waiting for 2 approved NSOC reviewer approvals';
+              }
+
+              if (mentorApproved || reviewerApproved) {
+                s2Icon = '✅';
+
+                if (isGSSOC) {
+                  s2Text =
+                    'Approved by required GSSOC mentors';
+                } else {
+                  s2Text =
+                    'Approved by required NSOC reviewers';
+                }
+              }
+            }
+
+            // Stage 3
+            let s3Icon = '🔒';
+            let s3Text = 'Blocked until Stage 2 passes';
+
+            if (mentorApproved || reviewerApproved) {
+
+              s3Icon = '⏳';
+              s3Text =
+                'Waiting for PA / maintainer final review';
+
+              if (paApproved) {
+                s3Icon = '✅';
+                s3Text =
+                  'Approved for merge by PA / maintainer';
+              }
+            }
+
+            // ─────────────────────────────────────────────
+            // Extra details
+            // ─────────────────────────────────────────────
+            let details = [];
+
+            if (!dcoVerified)
+              details.push(
+                'DCO verification pending'
+              );
+
+            if (dcoMissing)
+              details.push(
+                'DCO sign-off missing'
+              );
+
+            if (aiSlop)
+              details.push(
+                'AI/slop detection flagged this PR'
+              );
+
+            if (duplicatePR)
+              details.push(
+                'Possible duplicate PR detected'
+              );
+
+            // ─────────────────────────────────────────────
+            // PR type badge
+            // ─────────────────────────────────────────────
+            let typeBadge =
+              '> ⚪ Standard PR';
+
+            if (isGSSOC) {
+              typeBadge =
+                '> 🟢 GSSOC PR';
+            }
+
+            if (isNSOC) {
+              typeBadge =
+                '> 🔵 NSOC PR';
+            }
+
+            // ─────────────────────────────────────────────
+            // Build lifecycle comment
+            // ─────────────────────────────────────────────
+            const marker =
+              '<!-- pr-stage-manager -->';
+
+            const body =
+              `${marker}
+
+            ## 🚦 PR Review Pipeline
+
+            ${typeBadge}
+
+            | Stage | Status |
+            |-------|--------|
+            | **Stage 1 — Automated Validation** | ${s1Icon} ${s1Text} |
+            | **Stage 2 — Human Review** | ${s2Icon} ${s2Text} |
+            | **Stage 3 — PA / Maintainer Review** | ${s3Icon} ${s3Text} |
+
+            ${
+              details.length > 0
+                ? details.map(d => `> - ${d}`).join('\n')
+                : '> - No active warnings'
+            }
+
+            ---
+
+            ### 🤖 Stage 1 Automation
+            - DCO Verification
+            - AI / Slop Detection
+            - Duplicate PR Detection
+            - PR Validation
+            - Code Quality Checks
+
+            ### 👥 Stage 2 Human Review
+            ${
+              isGSSOC
+                ? '- Requires approval from 2 approved GSSOC mentors'
+                : '- Requires approval from 2 approved NSOC reviewers'
+            }
+
+            ### 🏁 Stage 3 Final Review
+            - PA / Maintainer verifies final quality
+            - Final merge approval happens here
+
+            ---
+
+            ✅ Bots never auto-merge PRs.
+            ✅ Final merge decisions are always human-reviewed.
+
+            *Last updated: ${new Date().toUTCString()}*
+            `;
+
+            // ─────────────────────────────────────────────
+            // Upsert comment
+            // ─────────────────────────────────────────────
+            const { data: comments } =
+              await github.rest.issues.listComments({
+                owner,
+                repo,
+                issue_number: prNumber,
+                per_page: 100
+              });
+
+            const existing =
+              comments.find(c =>
+                c.body.includes(marker)
+              );
+
+            if (existing) {
+
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+
+              core.info(
+                'Updated pipeline comment'
+              );
+
+            } else {
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body
+              });
+
+              core.info(
+                'Created pipeline comment'
+              );
+            }
